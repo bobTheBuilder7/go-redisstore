@@ -5,21 +5,22 @@ import (
 	"log"
 	"time"
 
-	"github.com/gomodule/redigo/redis"
-	"github.com/sethvargo/go-redisstore"
+	redisstore "github.com/bobTheBuilder7/go-redisstore"
+	"github.com/redis/go-redis/v9"
 )
 
 func ExampleNew() {
 	ctx := context.Background()
 
+	client := redis.NewClient(&redis.Options{
+		Addr: "127.0.0.1:6379",
+	})
+	defer client.Close()
+
 	store, err := redisstore.New(&redisstore.Config{
 		Tokens:   15,
 		Interval: time.Minute,
-		Dial: func() (redis.Conn, error) {
-			return redis.Dial("tcp", "127.0.0.1:6379",
-				redis.DialPassword("my-password"))
-		},
-	})
+	}, client)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -1,17 +1,47 @@
 package redisstore
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
-	"os"
+	"io"
+	"log"
 	"sort"
 	"testing"
 	"time"
 
-	"github.com/gomodule/redigo/redis"
+	"github.com/bobTheBuilder7/assert"
+	"github.com/redis/go-redis/v9"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
+
+func newRedisClient(t *testing.T) *redis.Client {
+	t.Helper()
+
+	redisC, err := testcontainers.Run(
+		t.Context(), "redis:latest",
+		testcontainers.WithLogger(log.New(io.Discard, "", 0)),
+		testcontainers.WithExposedPorts("6379/tcp"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("Ready to accept connections"),
+			wait.ForListeningPort("6379/tcp"),
+		),
+	)
+	defer testcontainers.CleanupContainer(t, redisC)
+	assert.Nil(t, err)
+
+	endpoint, err := redisC.PortEndpoint(t.Context(), "6379/tcp", "")
+	assert.Nil(t, err)
+
+	client := redis.NewClient(&redis.Options{Addr: endpoint})
+	t.Cleanup(func() { client.Close() })
+
+	err = client.Ping(t.Context()).Err()
+	assert.Nil(t, err)
+
+	return client
+}
 
 func testKey(tb testing.TB) string {
 	tb.Helper()
@@ -27,179 +57,95 @@ func testKey(tb testing.TB) string {
 func TestStore_Exercise(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-
-	host := os.Getenv("REDIS_HOST")
-	if host == "" {
-		t.Fatal("missing REDIS_HOST")
-	}
-
-	port := os.Getenv("REDIS_PORT")
-	if port == "" {
-		port = "6379"
-	}
-
-	pass := os.Getenv("REDIS_PASS")
+	ctx := t.Context()
+	client := newRedisClient(t)
 
 	s, err := New(&Config{
 		Tokens:   5,
 		Interval: 3 * time.Second,
-		Dial: func() (redis.Conn, error) {
-			return redis.Dial("tcp", host+":"+port,
-				redis.DialPassword(pass))
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := s.Close(ctx); err != nil {
-			t.Fatal(err)
-		}
-	})
+	}, client)
+	assert.Nil(t, err)
+	t.Cleanup(func() { s.Close(ctx) })
 
 	key := testKey(t)
 
 	// Get when no config exists
 	{
 		limit, remaining, err := s.Get(ctx, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if got, want := limit, uint64(0); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := remaining, uint64(0); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
+		assert.Nil(t, err)
+		assert.Equal(t, limit, uint64(0))
+		assert.Equal(t, remaining, uint64(0))
 	}
 
-	// Take with no key configuration - this should use the default values
+	// Take with no key configuration — uses default values
 	{
 		limit, remaining, reset, ok, err := s.Take(ctx, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !ok {
-			t.Errorf("expected ok")
-		}
-		if got, want := limit, uint64(5); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := remaining, uint64(4); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := time.Until(time.Unix(0, int64(reset))), 3*time.Second; got > want {
-			t.Errorf("expected %v to less than %v", got, want)
-		}
+		assert.Nil(t, err)
+		assert.True(t, ok)
+		assert.Equal(t, limit, uint64(5))
+		assert.Equal(t, remaining, uint64(4))
+		assert.True(t, time.Until(time.Unix(0, int64(reset))) <= 3*time.Second)
 	}
 
 	// Get the value
 	{
 		limit, remaining, err := s.Get(ctx, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got, want := limit, uint64(5); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := remaining, uint64(4); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
+		assert.Nil(t, err)
+		assert.Equal(t, limit, uint64(5))
+		assert.Equal(t, remaining, uint64(4))
 	}
 
-	// Now set a value
+	// Set a new configuration
 	{
-		if err := s.Set(ctx, key, 11, 5*time.Second); err != nil {
-			t.Fatal(err)
-		}
+		err := s.Set(ctx, key, 11, 5*time.Second)
+		assert.Nil(t, err)
 	}
 
-	// Get the value again
+	// Get after Set
 	{
 		limit, remaining, err := s.Get(ctx, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got, want := limit, uint64(11); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := remaining, uint64(11); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
+		assert.Nil(t, err)
+		assert.Equal(t, limit, uint64(11))
+		assert.Equal(t, remaining, uint64(11))
 	}
 
-	// Take again, this should use the new values
+	// Take uses new configuration
 	{
 		limit, remaining, reset, ok, err := s.Take(ctx, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !ok {
-			t.Errorf("expected ok")
-		}
-		if got, want := limit, uint64(11); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := remaining, uint64(10); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := time.Until(time.Unix(0, int64(reset))), 5*time.Second; got > want {
-			t.Errorf("expected %v to less than %v", got, want)
-		}
+		assert.Nil(t, err)
+		assert.True(t, ok)
+		assert.Equal(t, limit, uint64(11))
+		assert.Equal(t, remaining, uint64(10))
+		assert.True(t, time.Until(time.Unix(0, int64(reset))) <= 5*time.Second)
 	}
 
-	// Get the value again
+	// Get after Take
 	{
 		limit, remaining, err := s.Get(ctx, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got, want := limit, uint64(11); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := remaining, uint64(10); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
+		assert.Nil(t, err)
+		assert.Equal(t, limit, uint64(11))
+		assert.Equal(t, remaining, uint64(10))
 	}
 
-	// Burst and take
+	// Burst then Take
 	{
-		if err := s.Burst(ctx, key, 5); err != nil {
-			t.Fatal(err)
-		}
+		err := s.Burst(ctx, key, 5)
+		assert.Nil(t, err)
 
 		limit, remaining, reset, ok, err := s.Take(ctx, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !ok {
-			t.Errorf("expected ok")
-		}
-		if got, want := limit, uint64(11); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := remaining, uint64(14); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := time.Until(time.Unix(0, int64(reset))), 5*time.Second; got > want {
-			t.Errorf("expected %v to less than %v", got, want)
-		}
+		assert.Nil(t, err)
+		assert.True(t, ok)
+		assert.Equal(t, limit, uint64(11))
+		assert.Equal(t, remaining, uint64(14))
+		assert.True(t, time.Until(time.Unix(0, int64(reset))) <= 5*time.Second)
 	}
 
-	// Get the value one final time
+	// Final Get
 	{
 		limit, remaining, err := s.Get(ctx, key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got, want := limit, uint64(11); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
-		if got, want := remaining, uint64(14); got != want {
-			t.Errorf("expected %v to be %v", got, want)
-		}
+		assert.Nil(t, err)
+		assert.Equal(t, limit, uint64(11))
+		assert.Equal(t, remaining, uint64(14))
 	}
 }
 
@@ -210,19 +156,8 @@ func TestStore_Take(t *testing.T) {
 		t.Skipf("skipping (short)")
 	}
 
-	ctx := context.Background()
-
-	host := os.Getenv("REDIS_HOST")
-	if host == "" {
-		t.Fatal("missing REDIS_HOST")
-	}
-
-	port := os.Getenv("REDIS_PORT")
-	if port == "" {
-		port = "6379"
-	}
-
-	pass := os.Getenv("REDIS_PASS")
+	ctx := t.Context()
+	client := newRedisClient(t)
 
 	cases := []struct {
 		name     string
@@ -247,19 +182,9 @@ func TestStore_Take(t *testing.T) {
 			s, err := New(&Config{
 				Interval: tc.interval,
 				Tokens:   tc.tokens,
-				Dial: func() (redis.Conn, error) {
-					return redis.Dial("tcp", host+":"+port,
-						redis.DialPassword(pass))
-				},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if err := s.Close(ctx); err != nil {
-					t.Fatal(err)
-				}
-			})
+			}, client)
+			assert.Nil(t, err)
+			t.Cleanup(func() { s.Close(ctx) })
 
 			type result struct {
 				limit, remaining uint64
@@ -268,7 +193,7 @@ func TestStore_Take(t *testing.T) {
 				err              error
 			}
 
-			// Take twice everything
+			// Take twice the token count concurrently
 			takeCh := make(chan *result, 2*tc.tokens)
 			for i := uint64(1); i <= 2*tc.tokens; i++ {
 				go func() {
@@ -277,16 +202,16 @@ func TestStore_Take(t *testing.T) {
 				}()
 			}
 
-			// Accumulate and sort results, since they could come in any order
 			var results []*result
 			for i := uint64(1); i <= 2*tc.tokens; i++ {
 				select {
-				case result := <-takeCh:
-					results = append(results, result)
+				case r := <-takeCh:
+					results = append(results, r)
 				case <-time.After(5 * time.Second):
-					t.Fatal("timeout")
+					t.Fatal("timeout waiting for Take")
 				}
 			}
+
 			sort.Slice(results, func(i, j int) bool {
 				if results[i].remaining == results[j].remaining {
 					return !results[j].ok
@@ -294,47 +219,26 @@ func TestStore_Take(t *testing.T) {
 				return results[i].remaining > results[j].remaining
 			})
 
-			for i, result := range results {
-				if err := result.err; err != nil {
-					t.Fatal(err)
-				}
+			for i, r := range results {
+				assert.Nil(t, r.err)
+				assert.Equal(t, r.limit, tc.tokens)
+				assert.True(t, r.reset <= tc.interval)
 
-				if got, want := result.limit, tc.tokens; got != want {
-					t.Errorf("limit: expected %d to be %d", got, want)
-				}
-				if got, want := result.reset, tc.interval; got > want {
-					t.Errorf("reset: expected %d to be less than %d", got, want)
-				}
-
-				// first half should pass, second half should fail
 				if uint64(i) < tc.tokens {
-					if got, want := result.remaining, tc.tokens-uint64(i)-1; got != want {
-						t.Errorf("remaining: expected %d to be %d", got, want)
-					}
-					if got, want := result.ok, true; got != want {
-						t.Errorf("ok: expected %t to be %t", got, want)
-					}
+					assert.Equal(t, r.remaining, tc.tokens-uint64(i)-1)
+					assert.True(t, r.ok)
 				} else {
-					if got, want := result.remaining, uint64(0); got != want {
-						t.Errorf("remaining: expected %d to be %d", got, want)
-					}
-					if got, want := result.ok, false; got != want {
-						t.Errorf("ok: expected %t to be %t", got, want)
-					}
+					assert.Equal(t, r.remaining, uint64(0))
+					assert.False(t, r.ok)
 				}
 			}
 
-			// Wait for entries again
+			// Wait for the interval to reset
 			time.Sleep(tc.interval)
 
-			// Verify we can take once more
 			_, _, _, ok, err := s.Take(ctx, key)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !ok {
-				t.Errorf("expected %t to be %t", ok, true)
-			}
+			assert.Nil(t, err)
+			assert.True(t, ok)
 		})
 	}
 }

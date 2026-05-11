@@ -18,15 +18,7 @@ const (
 	fieldMaxTokens = "m"
 	fieldTokens    = "k"
 
-	// weekSeconds is the number of seconds in a week.
 	weekSeconds = 60 * 60 * 24 * 7
-
-	// Common Redis commands
-	cmdEXPIRE  = "EXPIRE"
-	cmdHINCRBY = "HINCRBY"
-	cmdHMGET   = "HMGET"
-	cmdHSET    = "HSET"
-	cmdPING    = "PING"
 )
 
 var _ limiter.Store = (*Store)(nil)
@@ -36,42 +28,19 @@ type Store struct {
 	interval  time.Duration
 	pool      *redis.Client
 	luaScript *redis.Script
-
-	stopped uint32
+	stopped   uint32
 }
 
-// Config is used as input to New. It defines the behavior of the storage
-// system.
+// Config is used as input to New. It defines the behavior of the storage system.
 type Config struct {
-	// Tokens is the number of tokens to allow per interval. The default value is
-	// 1.
+	// Tokens is the number of tokens to allow per interval. The default value is 1.
 	Tokens uint64
 
-	// Interval is the time interval upon which to enforce rate limiting. The
-	// default value is 1 second.
+	// Interval is the time interval upon which to enforce rate limiting. The default value is 1 second.
 	Interval time.Duration
-
-	// Dial is the function to use as the dialer. This is ignored when used with
-	// NewWithPool.
-	Dial func() (redis.Conn, error)
 }
 
-// New uses a Redis instance to back a rate limiter that to limit the number of
-// permitted events over an interval.
-// func New(c *Config) (*Store, error) {
-// return NewWithPool(c, &redis.Client{
-// 	MaxActive:   100,
-// 	IdleTimeout: 5 * time.Minute,
-// 	Dial:        c.Dial,
-// 	TestOnBorrow: func(c redis.Conn, _ time.Time) error {
-// 		_, err := c.Do(cmdPING)
-// 		return fmt.Errorf("failed to borrow: %w", err)
-// 	},
-// })
-// }
-
-// NewWithPool creates a new limiter using the given redis pool. Use this to
-// customize lower-level details about the pool.
+// New creates a new limiter backed by the given Redis client.
 func New(c *Config, pool *redis.Client) (*Store, error) {
 	if c == nil {
 		c = new(Config)
@@ -87,140 +56,135 @@ func New(c *Config, pool *redis.Client) (*Store, error) {
 		interval = c.Interval
 	}
 
-	luaScript := redis.NewScript(luaTemplate)
-
-	s := &Store{
+	return &Store{
 		tokens:    tokens,
 		interval:  interval,
 		pool:      pool,
-		luaScript: luaScript,
-	}
-	return s, nil
+		luaScript: redis.NewScript(luaTemplate),
+	}, nil
 }
 
 // Take attempts to remove a token from the named key. If the take is
 // successful, it returns true, otherwise false. It also returns the configured
-// limit, remaining tokens, and reset time, if one was found. Any errors
-// connecting to the store or parsing the return value are considered failures
-// and fail the take.
-func (s *Store) Take(ctx context.Context, key string) (limit uint64, remaining uint64, next uint64, ok bool, retErr error) {
-	// If the store is stopped, all requests are rejected.
+// limit, remaining tokens, and reset time.
+func (s *Store) Take(ctx context.Context, key string) (limit, remaining, next uint64, ok bool, retErr error) {
 	if atomic.LoadUint32(&s.stopped) == 1 {
 		retErr = limiter.ErrStopped
 		return
 	}
 
-	// Get the current time, since this is when the function was called, and we
-	// want to limit from call time, not invoke time.
 	now := uint64(time.Now().UTC().UnixNano())
-
-	nowStr := strconv.FormatUint(now, 10)
-	tokensStr := strconv.FormatUint(s.tokens, 10)
-	intervalStr := strconv.FormatInt(s.interval.Nanoseconds(), 10)
-	a, err := s.pool.Int64s(s.luaScript.Do(conn, key, nowStr, tokensStr, intervalStr))
+	res, err := s.luaScript.Run(ctx, s.pool, []string{key},
+		strconv.FormatUint(now, 10),
+		strconv.FormatUint(s.tokens, 10),
+		strconv.FormatInt(s.interval.Nanoseconds(), 10),
+	).Slice()
 	if err != nil {
 		retErr = fmt.Errorf("failed to run script: %w", err)
 		return
 	}
 
-	if len(a) < 4 {
-		retErr = fmt.Errorf("response has less than 4 values: %#v", a)
+	if len(res) < 4 {
+		retErr = fmt.Errorf("unexpected response length %d", len(res))
 		return
 	}
 
-	limit, remaining, next, ok = uint64(a[0]), uint64(a[1]), uint64(a[2]), a[3] == 1
+	limit = uint64(res[0].(int64))
+	remaining = uint64(res[1].(int64))
+	next = uint64(res[2].(int64))
+	// Lua true → RESP integer 1; Lua false → RESP null (nil)
+	ok = res[3] != nil
 	return
 }
 
-// Get gets the current limit and remaining tokens for the key. It does not
-// reduce or reset any counters.
+// Get gets the current limit and remaining tokens for the key without
+// consuming any tokens.
 func (s *Store) Get(ctx context.Context, key string) (limit, remaining uint64, retErr error) {
-	// If the store is stopped, all requests are rejected.
 	if atomic.LoadUint32(&s.stopped) == 1 {
 		retErr = limiter.ErrStopped
 		return
 	}
 
-	result, err := r.pool.Int64s(conn.Do(cmdHMGET, key, fieldMaxTokens, fieldTokens))
+	vals, err := s.pool.HMGet(ctx, key, fieldMaxTokens, fieldTokens).Result()
 	if err != nil {
 		retErr = fmt.Errorf("failed to get key: %w", err)
 		return
 	}
 
-	if got, want := len(result), 2; got != want {
-		retErr = fmt.Errorf("not enough keys returned, expected %d got %d", want, got)
+	if len(vals) < 2 {
+		retErr = fmt.Errorf("not enough fields returned: expected 2 got %d", len(vals))
 		return
 	}
 
-	limit = uint64(result[0])
-	remaining = uint64(result[1])
+	if vals[0] != nil {
+		v, err := strconv.ParseUint(vals[0].(string), 10, 64)
+		if err != nil {
+			retErr = fmt.Errorf("failed to parse limit: %w", err)
+			return
+		}
+		limit = v
+	}
+
+	if vals[1] != nil {
+		v, err := strconv.ParseUint(vals[1].(string), 10, 64)
+		if err != nil {
+			retErr = fmt.Errorf("failed to parse remaining: %w", err)
+			return
+		}
+		remaining = v
+	}
+
 	return
 }
 
 // Set sets the key's limit to the provided value and interval.
 func (s *Store) Set(ctx context.Context, key string, tokens uint64, interval time.Duration) (retErr error) {
-	// If the store is stopped, all requests are rejected.
 	if atomic.LoadUint32(&s.stopped) == 1 {
 		retErr = limiter.ErrStopped
 		return
 	}
 
-	// Set configuration on the key.
 	tokensStr := strconv.FormatUint(tokens, 10)
 	intervalStr := strconv.FormatInt(interval.Nanoseconds(), 10)
-	if err := s.pool.Send(cmdHSET, key,
+
+	pipe := s.pool.Pipeline()
+	pipe.HSet(ctx, key,
 		fieldTokens, tokensStr,
 		fieldMaxTokens, tokensStr,
 		fieldInterval, intervalStr,
-	); err != nil {
+	)
+	pipe.Expire(ctx, key, time.Duration(weekSeconds)*time.Second)
+
+	if _, err := pipe.Exec(ctx); err != nil {
 		retErr = fmt.Errorf("failed to set key: %w", err)
-		return
 	}
-
-	// Set the key to expire. This will prevent a leak when a key's configuration
-	// is set, but nothing is ever taken from the bucket.
-	if err := s.pool.Send(cmdEXPIRE, key, weekSeconds); err != nil {
-		retErr = fmt.Errorf("failed to set expire on key: %w", err)
-		return
-	}
-
 	return
 }
 
-// Burst adds the given tokens to the key's bucket.
+// Burst adds the given tokens to the key's current token count.
 func (s *Store) Burst(ctx context.Context, key string, tokens uint64) (retErr error) {
-	// If the store is stopped, all requests are rejected.
 	if atomic.LoadUint32(&s.stopped) == 1 {
 		retErr = limiter.ErrStopped
 		return
 	}
 
-	// Set configuration on the key.
-	tokensStr := strconv.FormatUint(tokens, 10)
-	if err := s.pool.Send(cmdHINCRBY, key, fieldTokens, tokensStr); err != nil {
-		retErr = fmt.Errorf("failed to set key: %w", err)
-		return
-	}
+	pipe := s.pool.Pipeline()
+	pipe.HIncrBy(ctx, key, fieldTokens, int64(tokens))
+	pipe.Expire(ctx, key, time.Duration(weekSeconds)*time.Second)
 
-	// Set the key to expire. This will prevent a leak when a key's configuration
-	// is set, but nothing is ever taken from the bucket.
-	if err := s.pool.Send(cmdEXPIRE, key, weekSeconds); err != nil {
-		retErr = fmt.Errorf("failed to set expire on key: %w", err)
-		return
+	if _, err := pipe.Exec(ctx); err != nil {
+		retErr = fmt.Errorf("failed to burst key: %w", err)
 	}
 
 	return
 }
 
-// Close stops the memory limiter and cleans up any outstanding sessions. You
-// should always call CloseWithContext() as it releases any open network
-// connections.
+// Close stops the store and releases any open connections.
 func (s *Store) Close(_ context.Context) error {
 	if !atomic.CompareAndSwapUint32(&s.stopped, 0, 1) {
 		return nil
 	}
 
-	// Close the connection pool.
 	if err := s.pool.Close(); err != nil {
 		return fmt.Errorf("failed to close pool: %w", err)
 	}
