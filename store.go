@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gomodule/redigo/redis"
+	"github.com/redis/go-redis/v9"
 	"github.com/sethvargo/go-limiter"
 )
 
@@ -34,7 +34,7 @@ var _ limiter.Store = (*Store)(nil)
 type Store struct {
 	tokens    uint64
 	interval  time.Duration
-	pool      *redis.Pool
+	pool      *redis.Client
 	luaScript *redis.Script
 
 	stopped uint32
@@ -58,21 +58,21 @@ type Config struct {
 
 // New uses a Redis instance to back a rate limiter that to limit the number of
 // permitted events over an interval.
-func New(c *Config) (*Store, error) {
-	return NewWithPool(c, &redis.Pool{
-		MaxActive:   100,
-		IdleTimeout: 5 * time.Minute,
-		Dial:        c.Dial,
-		TestOnBorrow: func(c redis.Conn, _ time.Time) error {
-			_, err := c.Do(cmdPING)
-			return fmt.Errorf("failed to borrow: %w", err)
-		},
-	})
-}
+// func New(c *Config) (*Store, error) {
+// return NewWithPool(c, &redis.Client{
+// 	MaxActive:   100,
+// 	IdleTimeout: 5 * time.Minute,
+// 	Dial:        c.Dial,
+// 	TestOnBorrow: func(c redis.Conn, _ time.Time) error {
+// 		_, err := c.Do(cmdPING)
+// 		return fmt.Errorf("failed to borrow: %w", err)
+// 	},
+// })
+// }
 
 // NewWithPool creates a new limiter using the given redis pool. Use this to
 // customize lower-level details about the pool.
-func NewWithPool(c *Config, pool *redis.Pool) (*Store, error) {
+func New(c *Config, pool *redis.Client) (*Store, error) {
 	if c == nil {
 		c = new(Config)
 	}
@@ -87,7 +87,7 @@ func NewWithPool(c *Config, pool *redis.Pool) (*Store, error) {
 		interval = c.Interval
 	}
 
-	luaScript := redis.NewScript(1, luaTemplate)
+	luaScript := redis.NewScript(luaTemplate)
 
 	s := &Store{
 		tokens:    tokens,
@@ -114,22 +114,10 @@ func (s *Store) Take(ctx context.Context, key string) (limit uint64, remaining u
 	// want to limit from call time, not invoke time.
 	now := uint64(time.Now().UTC().UnixNano())
 
-	// Get a client from the pool.
-	conn, err := s.pool.GetContext(ctx)
-	if err != nil {
-		retErr = fmt.Errorf("failed to get connection from pool: %w", err)
-		return
-	}
-	if err := conn.Err(); err != nil {
-		retErr = fmt.Errorf("connection is not usable: %w", err)
-		return
-	}
-	defer closeConnection(conn, &retErr)
-
 	nowStr := strconv.FormatUint(now, 10)
 	tokensStr := strconv.FormatUint(s.tokens, 10)
 	intervalStr := strconv.FormatInt(s.interval.Nanoseconds(), 10)
-	a, err := redis.Int64s(s.luaScript.Do(conn, key, nowStr, tokensStr, intervalStr))
+	a, err := s.pool.Int64s(s.luaScript.Do(conn, key, nowStr, tokensStr, intervalStr))
 	if err != nil {
 		retErr = fmt.Errorf("failed to run script: %w", err)
 		return
@@ -153,19 +141,7 @@ func (s *Store) Get(ctx context.Context, key string) (limit, remaining uint64, r
 		return
 	}
 
-	// Get a client from the pool.
-	conn, err := s.pool.GetContext(ctx)
-	if err != nil {
-		retErr = fmt.Errorf("failed to get connection from pool: %w", err)
-		return
-	}
-	if err := conn.Err(); err != nil {
-		retErr = fmt.Errorf("connection is not usable: %w", err)
-		return
-	}
-	defer closeConnection(conn, &retErr)
-
-	result, err := redis.Int64s(conn.Do(cmdHMGET, key, fieldMaxTokens, fieldTokens))
+	result, err := r.pool.Int64s(conn.Do(cmdHMGET, key, fieldMaxTokens, fieldTokens))
 	if err != nil {
 		retErr = fmt.Errorf("failed to get key: %w", err)
 		return
@@ -189,22 +165,10 @@ func (s *Store) Set(ctx context.Context, key string, tokens uint64, interval tim
 		return
 	}
 
-	// Get a client from the pool.
-	conn, err := s.pool.GetContext(ctx)
-	if err != nil {
-		retErr = fmt.Errorf("failed to get connection from pool: %w", err)
-		return
-	}
-	if err := conn.Err(); err != nil {
-		retErr = fmt.Errorf("connection is not usable: %w", err)
-		return
-	}
-	defer closeConnection(conn, &retErr)
-
 	// Set configuration on the key.
 	tokensStr := strconv.FormatUint(tokens, 10)
 	intervalStr := strconv.FormatInt(interval.Nanoseconds(), 10)
-	if err := conn.Send(cmdHSET, key,
+	if err := s.pool.Send(cmdHSET, key,
 		fieldTokens, tokensStr,
 		fieldMaxTokens, tokensStr,
 		fieldInterval, intervalStr,
@@ -215,7 +179,7 @@ func (s *Store) Set(ctx context.Context, key string, tokens uint64, interval tim
 
 	// Set the key to expire. This will prevent a leak when a key's configuration
 	// is set, but nothing is ever taken from the bucket.
-	if err := conn.Send(cmdEXPIRE, key, weekSeconds); err != nil {
+	if err := s.pool.Send(cmdEXPIRE, key, weekSeconds); err != nil {
 		retErr = fmt.Errorf("failed to set expire on key: %w", err)
 		return
 	}
@@ -231,28 +195,16 @@ func (s *Store) Burst(ctx context.Context, key string, tokens uint64) (retErr er
 		return
 	}
 
-	// Get a client from the pool.
-	conn, err := s.pool.GetContext(ctx)
-	if err != nil {
-		retErr = fmt.Errorf("failed to get connection from pool: %w", err)
-		return
-	}
-	if err := conn.Err(); err != nil {
-		retErr = fmt.Errorf("connection is not usable: %w", err)
-		return
-	}
-	defer closeConnection(conn, &retErr)
-
 	// Set configuration on the key.
 	tokensStr := strconv.FormatUint(tokens, 10)
-	if err := conn.Send(cmdHINCRBY, key, fieldTokens, tokensStr); err != nil {
+	if err := s.pool.Send(cmdHINCRBY, key, fieldTokens, tokensStr); err != nil {
 		retErr = fmt.Errorf("failed to set key: %w", err)
 		return
 	}
 
 	// Set the key to expire. This will prevent a leak when a key's configuration
 	// is set, but nothing is ever taken from the bucket.
-	if err := conn.Send(cmdEXPIRE, key, weekSeconds); err != nil {
+	if err := s.pool.Send(cmdEXPIRE, key, weekSeconds); err != nil {
 		retErr = fmt.Errorf("failed to set expire on key: %w", err)
 		return
 	}
@@ -272,15 +224,6 @@ func (s *Store) Close(_ context.Context) error {
 	if err := s.pool.Close(); err != nil {
 		return fmt.Errorf("failed to close pool: %w", err)
 	}
-	return nil
-}
 
-// closeConnection is a helper for closing the connection object. It is used in
-// defer statements to alter the provided error pointer before the final result
-// is bubbled up the stack.
-func closeConnection(c redis.Conn, err *error) {
-	nerr := c.Close()
-	if *err == nil {
-		*err = nerr
-	}
+	return nil
 }
